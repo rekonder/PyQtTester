@@ -184,7 +184,7 @@ def parse_args():
 
     parser_record.add_argument(
         '--events-include', metavar='REGEX',
-        default=r'MouseEvent,KeyEvent,CloseEvent',  # TODO: add Drag, Focus, Hover ?
+        default=r'MouseEvent,KeyEvent,CloseEvent,FocusEvent,DragLeaveEvent,DragEnterEvent,HoverEvent,ChildEvent',  # TODO: add Drag, Focus, Hover ?
         help='When recording, record only events that match the filter.')
     parser_record.add_argument(
         '--events-exclude', metavar='REGEX',
@@ -499,6 +499,11 @@ class Resolver:
         'QKeyEvent': 'type key modifiers text isAutoRepeat count'.split(),
         'QMoveEvent': 'pos oldPos'.split(),
         'QCloseEvent': [],
+        'QChildEvent' : 'type child'.split(),
+        'QFocusEvent' : 'type reason'.split(),
+        'QDragLeaveEvent' : [],
+        'QDragEnterEvent' : 'point actions data buttons modifiers'.split(),
+        'QHoverEvent' : 'type pos oldPos'.split(), #for qt4
     }
 
     @classmethod
@@ -581,7 +586,7 @@ class Resolver:
 
         path = []
         parent = obj
-        while parent:
+        while parent is not None:
             widget, parent = parent, parent.parentWidget()
             children = cls._get_children(parent)
             # This typed index is more resilient than simple layout.indexOf()
@@ -730,6 +735,8 @@ class EventRecorder(_EventFilter):
     def __init__(self, file, events_include, events_exclude):
         super().__init__()
         self.file = file
+        self.skipped = []
+        self.stevec = 0
 
         # Prepare the recorded events stack;
         # the first entry is the protocol version
@@ -754,8 +761,12 @@ class EventRecorder(_EventFilter):
         # Only process out-of-application, system (e.g. X11) events
         # if not event.spontaneous():
         #     return False
+
         is_skipped = (not self.event_matches(type(event).__name__) or
                       not isinstance(obj, QWidget))  # FIXME: This condition is too strict (QGraphicsItems are QOjects)
+
+        if not isinstance(obj, QWidget):
+            self.stevec +=1
         log_ = log.debug if is_skipped else log.info
         log.info('Caught %s%s %s event (%s) on object %s',
                  'skipped' if is_skipped else 'recorded',
@@ -763,6 +774,12 @@ class EventRecorder(_EventFilter):
                  EVENT_TYPE.get(event.type(),
                                 'Unknown(type=' + str(event.type()) + ')'),
                  event.__class__.__name__, obj)
+        if EVENT_TYPE.get(event.type()) == 'ChildAdded':
+            pass
+        if is_skipped:
+            self.skipped.append(EVENT_TYPE.get(event.type(),
+                                'Unknown(type=' + str(event.type()) + ')'))
+
         # Before any event on any widget, make sure the window of that window
         # is active and raised (in front). This is required for replaying
         # without a window manager.
@@ -785,7 +802,9 @@ class EventRecorder(_EventFilter):
         log.info("Scenario of %d events written into '%s'",
                  len(self.events) - SCENARIO_FORMAT_VERSION - 1, self.file.name)
         log.debug(self.events)
-
+        for i in set(self.skipped):
+            log.info(i)
+        log.info(self.stevec)
 
 class EventReplayer(_EventFilter):
     def __init__(self, file):
