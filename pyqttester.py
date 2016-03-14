@@ -184,7 +184,7 @@ def parse_args():
 
     parser_record.add_argument(
         '--events-include', metavar='REGEX',
-        default='MouseEvent,KeyEvent,CloseEvent,FocusEvent,DragLeaveEvent,DragEnterEvent,HoverEvent,HideEvent,'
+        default=r'MouseEvent,KeyEvent,CloseEvent,FocusEvent,DragLeaveEvent,DragEnterEvent,HoverEvent,HideEvent,'
                 'ShowEvent,StatusTipEvent,ResizeEvent,SocketNotifier',  # TODO: add Drag, Focus, Hover ?
                 #ChildEvent do not work'
         help='When recording, record only events that match the filter.')
