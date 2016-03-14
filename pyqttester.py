@@ -184,7 +184,9 @@ def parse_args():
 
     parser_record.add_argument(
         '--events-include', metavar='REGEX',
-        default=r'MouseEvent,KeyEvent,CloseEvent,FocusEvent,DragLeaveEvent,DragEnterEvent,HoverEvent,ChildEvent',  # TODO: add Drag, Focus, Hover ?
+        default='MouseEvent,KeyEvent,CloseEvent,FocusEvent,DragLeaveEvent,DragEnterEvent,HoverEvent,HideEvent,'
+                'ShowEvent,StatusTipEvent,ResizeEvent,SocketNotifier',  # TODO: add Drag, Focus, Hover ?
+                #ChildEvent do not work'
         help='When recording, record only events that match the filter.')
     parser_record.add_argument(
         '--events-exclude', metavar='REGEX',
@@ -476,6 +478,10 @@ class Resolver:
                                                       value.y(),
                                                       value.width(),
                                                       value.height())
+        if isinstance(value, (QtCore.QSize, QtCore.QSizeF)):
+            return 'QtCore.{}({}, {})'.format(type(value).__name__,
+                                                        value.width(),
+                                                        value.height())
         # Perhaps it's an enum value from Qt namespace
         assert isinstance(Qt.LeftButton, int)
         if isinstance(value, int):
@@ -504,6 +510,13 @@ class Resolver:
         'QDragLeaveEvent' : [],
         'QDragEnterEvent' : 'point actions data buttons modifiers'.split(),
         'QHoverEvent' : 'type pos oldPos'.split(), #for qt4
+        'QPaintEvent' : 'paintRegion'.split(),
+        'QHideEvent' : [],
+        'QShowEvent' : [],
+        'QStatusTipEvent' : 'tip'.split(),
+        'QResizeEvent' : 'size oldSize'.split(),
+        'QActionEvent' : 'type action before'.split(),
+        'QSocketNotifier' : 'socket type parent'.split(),
     }
 
     @classmethod
@@ -735,8 +748,6 @@ class EventRecorder(_EventFilter):
     def __init__(self, file, events_include, events_exclude):
         super().__init__()
         self.file = file
-        self.skipped = []
-        self.stevec = 0
 
         # Prepare the recorded events stack;
         # the first entry is the protocol version
@@ -765,8 +776,6 @@ class EventRecorder(_EventFilter):
         is_skipped = (not self.event_matches(type(event).__name__) or
                       not isinstance(obj, QWidget))  # FIXME: This condition is too strict (QGraphicsItems are QOjects)
 
-        if not isinstance(obj, QWidget):
-            self.stevec +=1
         log_ = log.debug if is_skipped else log.info
         log.info('Caught %s%s %s event (%s) on object %s',
                  'skipped' if is_skipped else 'recorded',
@@ -774,11 +783,6 @@ class EventRecorder(_EventFilter):
                  EVENT_TYPE.get(event.type(),
                                 'Unknown(type=' + str(event.type()) + ')'),
                  event.__class__.__name__, obj)
-        if EVENT_TYPE.get(event.type()) == 'ChildAdded':
-            pass
-        if is_skipped:
-            self.skipped.append(EVENT_TYPE.get(event.type(),
-                                'Unknown(type=' + str(event.type()) + ')'))
 
         # Before any event on any widget, make sure the window of that window
         # is active and raised (in front). This is required for replaying
@@ -802,9 +806,6 @@ class EventRecorder(_EventFilter):
         log.info("Scenario of %d events written into '%s'",
                  len(self.events) - SCENARIO_FORMAT_VERSION - 1, self.file.name)
         log.debug(self.events)
-        for i in set(self.skipped):
-            log.info(i)
-        log.info(self.stevec)
 
 class EventReplayer(_EventFilter):
     def __init__(self, file):
