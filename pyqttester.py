@@ -1,37 +1,29 @@
 #!/usr/bin/env python3
 
-import sys; REAL_EXIT = sys.exit
+import sys
 import os
+from os.path import dirname, join
 import re
 import signal
+import pickle
+import logging
 import subprocess
-from functools import reduce, wraps
+from functools import reduce, lru_cache
 from collections import namedtuple
-from itertools import chain, islice, count, repeat
+from itertools import islice, count, repeat
 from importlib import import_module
 
-try: import cPickle as pickle
-except ImportError: import pickle
-
-
-try: from functools import lru_cache
-except ImportError:  # Py2
-    def lru_cache(_):
-        def decorator(func):
-            cache = {}
-            @wraps(func)
-            def f(*args, **kwargs):
-                key = (args, tuple(kwargs.items()))
-                if key not in cache:
-                    cache[key] = func(*args, **kwargs)
-                return cache[key]
-            return f
-        return decorator
-
+REAL_EXIT = sys.exit
 
 __version__ = '0.1.0'
 
 SCENARIO_FORMAT_VERSION = 1
+X11_SHELL_SCRIPT = open(join(dirname(__file__), 'x11_subprocess.sh')).read()
+
+log = logging.getLogger(__name__)
+
+# Forward declared
+QtGui, QtCore, QWidget, Qt, qApp, QT_KEYS, EVENT_TYPE = repeat(None, 7)
 
 
 def deepgetattr(obj, attr):
@@ -44,80 +36,9 @@ def nth(n, iterable, default=None):
     return next(islice(iterable, n, None), default)
 
 
-## This shell script is run if program is run with --x11 option
-SHELL_SCRIPT = r'''
-
-# set -x  # Enable debugging
-set -e
-
-clean_up () {{
-    XAUTHORITY={AUTH_FILE} xauth remove :{DISPLAY} >/dev/null 2>&1
-    kill $(cat $XVFB_PID_FILE) >/dev/null 2>&1
-}}
-
-trap clean_up EXIT
-
-start_x11 () {{
-    # Appropriated from xvfb-run
-
-    touch {AUTH_FILE}
-    XAUTHORITY={AUTH_FILE} {XAUTH} add :{DISPLAY} . {MCOOKIE}
-
-    # Handle SIGUSR1 so Xvfb knows to send a signal when ready. I don't really
-    # understand how this was supposed to be handled by the code below, but
-    # xvfb-run did it like this so ...
-
-    trap : USR1
-    (trap '' USR1;
-     exec {XVFB} :{DISPLAY} -nolisten tcp  \
-                            -auth {AUTH_FILE}  \
-                            -fbdir /tmp -screen 0 {RESOLUTION}x16  \
-        >/dev/null 2>&1) &
-    XVFB_PID=$!
-    echo $XVFB_PID > $XVFB_PID_FILE
-    wait || :
-
-    if ! kill -0 $XVFB_PID 2>/dev/null; then
-        echo 'ERROR: Xvfb failed to start'
-        echo 1 > $RETVAL_FILE
-        return 1
-    fi
-
-    set +e
-    DISPLAY=:{DISPLAY} XAUTHORITY={AUTH_FILE} sh -c '{ARGV}'
-    echo $? > $RETVAL_FILE
-    set -e
-}}
-
-start_ffmpeg () {{
-    [ "{VIDEO_FILE}" ] || return
-    ffmpeg -y -nostats -hide_banner -loglevel fatal -r 25 \
-           -f x11grab -s {RESOLUTION} -i :{DISPLAY} {VIDEO_FILE} </dev/null &
-    echo $! > $FFMPEG_PID_FILE
-}}
-
-kill_ffmpeg () {{
-    [ "{VIDEO_FILE}" ] || return
-    kill $(cat $FFMPEG_PID_FILE) 2>/dev/null
-}}
-
-# WTF: For some reason variables don't retain values across functions ???
-TMPDIR=${{TMPDIR:-/tmp/}}
-FFMPEG_PID_FILE=$(mktemp $TMPDIR/pyqttester.ffmpeg.XXXXXXX)
-XVFB_PID_FILE=$(mktemp $TMPDIR/pyqttester.xvfb.XXXXXXX)
-RETVAL_FILE=$(mktemp $TMPDIR/pyqttester.retval.XXXXXXX)
-
-# First start the Xvfb instance, replaying the scenario inside.
-# Right afterwards, start screengrabbing the Xvfb session with ffmpeg.
-# When the scenario completes, kill ffmpeg as well.
-
-{{ start_x11; kill_ffmpeg; }} & start_ffmpeg ; wait
-
-RETVAL=$(cat $RETVAL_FILE)
-rm $FFMPEG_PID_FILE #RETVAL_FILE
-exit $RETVAL
-
-'''
+def typed_nth(n, target_type, iterable, default=None):
+    """Return the n-th item of type from iterable"""
+    return nth(n, (i for i in iterable if type(i) == target_type), default)
 
 
 def parse_args():
@@ -212,9 +133,6 @@ def parse_args():
     args = argparser.parse_args()
 
     def init_logging(verbose=0, log_file=None):
-        import logging
-        global log
-        log = logging.getLogger(__name__)
         formatter = logging.Formatter('%(relativeCreated)d %(levelname)s: %(message)s')
         for handler in (logging.StreamHandler(),
                         log_file and logging.FileHandler(log_file, 'w', encoding='utf-8')):
@@ -231,8 +149,11 @@ def parse_args():
         REAL_EXIT(1)
 
     def _is_command_available(command):
-        try: return 0 == subprocess.call(['which', command], stdout=subprocess.DEVNULL)
-        except OSError: return False
+        try:
+            return subprocess.call(['which', command],
+                                   stdout=subprocess.DEVNULL) == 0
+        except OSError:
+            return False
 
     def _check_main(args):
 
@@ -240,17 +161,17 @@ def parse_args():
             # Make the application believe it was run unpatched
             sys.argv = [entry_point] + args.args
             try:
-                module, main = entry_point.split(':')
+                module, main_func = entry_point.split(':')
                 log.debug('Importing module %s ...', module)
                 module = import_module(module)
-                main = deepgetattr(module, main)
-                if not callable(main):
+                real_main = deepgetattr(module, main_func)
+                if not callable(real_main):
                     raise ValueError
             except ValueError:
                 _error('MODULE_PATH must be like module.path.to:main function')
             else:
                 log.info('Running %s', entry_point)
-                main()
+                real_main()
 
         args.main = _main
 
@@ -275,25 +196,28 @@ def parse_args():
                       if isinstance(v, int)}
         # This is just a simple unit test. Put here because real Qt has only
         # been made available above.
-        assert 'Qt.LeftButton|Qt.RightButton' == \
-               Resolver._qflags_key(Qt, Qt.LeftButton | Qt.RightButton)
+        assert Resolver._qflags_key(Qt, Qt.LeftButton | Qt.RightButton) == \
+               'Qt.LeftButton|Qt.RightButton'
 
     def check_explain(args):
-        try: args.scenario = open(args.scenario, 'rb')
+        try:
+            args.scenario = open(args.scenario, 'rb')
         except (IOError, OSError) as e:
             _error('explain %s: %s', args.scenario, e)
 
     def check_record(args):
         _check_main(args)
         _global_qt(args)
-        try: args.scenario = open(args.scenario, 'wb')
+        try:
+            args.scenario = open(args.scenario, 'wb')
         except (IOError, OSError) as e:
             _error('record %s: %s', args.scenario, e)
 
     def check_replay(args):
         _check_main(args)
         _global_qt(args)
-        try: args.scenario = open(args.scenario, 'rb')
+        try:
+            args.scenario = open(args.scenario, 'rb')
         except (IOError, OSError) as e:
             _error('replay %s: %s', args.scenario, e)
         # TODO: https://coverage.readthedocs.org/en/coverage-4.0.2/api.html#api
@@ -311,38 +235,47 @@ def parse_args():
             for xvfb in ('Xvfb', '/usr/X11/bin/Xvfb'):
                 if _is_command_available(xvfb):
                     break
-            else: _error('Headless X11 (--x11) requires working Xvfb. '
-                         'Install package xvfb (or XQuartz on a Macintosh).')
+            else:
+                _error('Headless X11 (--x11) requires working Xvfb. '
+                       'Install package xvfb (or XQuartz on a Macintosh).')
             for xauth in ('xauth', '/usr/X11/bin/xauth'):
                 if _is_command_available(xauth):
                     break
-            else: _error('Headless X11 (--x11) requires working xauth. '
-                         'Install package xauth (or XQuartz on a Macintosh).')
+            else:
+                _error('Headless X11 (--x11) requires working xauth. '
+                       'Install package xauth (or XQuartz on a Macintosh).')
 
             log.info('Re-running head-less in Xvfb.')
             # Prevent recursion
             for arg in ('--x11', '--x11-video'):
-                try: sys.argv.remove(arg)
-                except ValueError: pass
+                if arg in sys.argv:
+                    sys.argv.remove(arg)
 
             from random import randint
             from hashlib import md5
-            command_line = SHELL_SCRIPT.format(
-                    VIDEO_FILE=args.x11_video,
-                    RESOLUTION='1280x1024',
-                    SCENARIO=args.scenario.name,
-                    AUTH_FILE=os.path.join(os.path.expanduser('~'), '.Xauthority'),
-                    XVFB=xvfb,
-                    XAUTH=xauth,
-                    MCOOKIE=md5(os.urandom(30)).hexdigest(),
-                    DISPLAY=next(i for i in (randint(111, 10000) for _ in repeat(0))
-                                 if not os.path.exists('/tmp/.X{}-lock'.format(i))),
-                    ARGV=' '.join(sys.argv))
-            REAL_EXIT(subprocess.call(command_line, shell=True, stdout=sys.stderr))
+            env = os.environ.copy()
+            env.update(
+                VIDEO_FILE=args.x11_video,
+                RESOLUTION='1280x1024',
+                SCENARIO=args.scenario.name,
+                AUTH_FILE=os.path.join(os.path.expanduser('~'), '.Xauthority'),
+                XVFB=xvfb,
+                XAUTH=xauth,
+                MCOOKIE=md5(os.urandom(30)).hexdigest(),
+                DISPLAY=next(i for i in (randint(111, 10000) for _ in repeat(0))
+                             if not os.path.exists('/tmp/.X{}-lock'.format(i))),
+                ARGV=' '.join(sys.argv))
+            REAL_EXIT(subprocess.call(X11_SHELL_SCRIPT,
+                                      shell=True,
+                                      stdout=sys.stderr,
+                                      env=env))
 
-    dict(record=check_record,
-         replay=check_replay,
-         explain=check_explain)[args._subcommand](args)
+    try:
+        dict(record=check_record,
+             replay=check_replay,
+             explain=check_explain)[args._subcommand](args)
+    except KeyError:
+        return REAL_EXIT(argparser.format_help())
     return args
 
 
@@ -450,7 +383,7 @@ class Resolver:
             mask <<= 1
         if not keys and value == 0:
             keys.append(cls._qenum_key(base, klass(0), klass=klass))
-        return '|'.join(filter(None, keys))
+        return '|'.join([k for k in keys if k])
 
     @classmethod
     def _serialize_value(cls, value, attr):
@@ -458,7 +391,6 @@ class Resolver:
         value_type = type(value)
         if value_type == int:
             if attr == 'key':
-                global QT_KEYS
                 return QT_KEYS[value]
             return str(value)
         if value_type == str:
@@ -525,7 +457,7 @@ class Resolver:
     }
 
     @classmethod
-    def serialize_event(cls, event) -> str:
+    def serialize_event(cls, event):
         assert isinstance(event, QtCore.QEvent)
 
         event_type = type(event)
@@ -541,7 +473,8 @@ class Resolver:
             event_attributes = iter(event_attributes); next(event_attributes)
         for attr in event_attributes:
             value = getattr(event, attr)()
-            try: args.append(cls._serialize_value(value, attr))
+            try:
+                args.append(cls._serialize_value(value, attr))
             except ValueError:
                 args.append('0b0')
                 log.warning("Can't serialize object %s of type %s "
@@ -553,11 +486,10 @@ class Resolver:
 
     @staticmethod
     def deserialize_event(event_str):
-        if event_str.startswith('QEvent('):   # Generic, unspecialized QEvent
-            event = eval('QtCore.' + event_str)  # FIXME: deprecate?
-        else:
-            event = eval('QtGui.' + event_str)
-        return event
+        try:
+            return eval('QtGui.' + event_str)
+        except AttributeError:
+            return eval('QtCore.' + event_str)
 
     @staticmethod
     @lru_cache()
@@ -580,23 +512,26 @@ class Resolver:
         layout, or if the widget splits them, or if they are QObject children
         of widget, or similar.
         """
-        if not widget:
-            return qApp.topLevelWidgets()
-
-        parts = []
+        if widget is None:
+            yield from qApp.topLevelWidgets()
 
         if isinstance(widget, QtGui.QSplitter):
-            parts.append(widget.widget(i) for i in range(widget.count()))
-            parts.append(widget.handle(i) for i in range(widget.count()))
+            yield from (widget.widget(i) for i in range(widget.count()))
+            yield from (widget.handle(i) for i in range(widget.count()))
 
-        layout = getattr(widget, 'layout', lambda: None)()
+        layout = hasattr(widget, 'layout') and widget.layout()
         if layout:
-            parts.append(layout.itemAt(i).widget()
-                         for i in range(layout.count()))
+            yield from (layout.itemAt(i).widget()
+                        for i in range(layout.count()))
 
-        parts.append(getattr(widget, 'children', lambda: ())())
+        if hasattr(widget, 'children'):
+            yield from widget.children()
 
-        return chain.from_iterable(parts)
+        # If widget can't be found in the hierarchy by Qt means,
+        # try Python object attributes
+        yield from (getattr(widget, attr)
+                    for attr in dir(widget)
+                    if not attr.startswith('__') and attr.endswith('__'))
 
     @classmethod
     def serialize_object(cls, obj):
@@ -608,14 +543,8 @@ class Resolver:
             widget, parent = parent, parent.parentWidget()
             children = cls._get_children(parent)
             # This typed index is more resilient than simple layout.indexOf()
-            index = next((i for i, w in enumerate(w for w in children
-                                                  if type(w) == type(widget))
-                          if w is widget), None)
-            # If widget can't be found in the hierarchy by Qt means,
-            # try Python object attributes
-            if index is None:
-                children = cls._get_attr_children(parent)
-                index = next((k for k, v in children.items() if v is widget), None)
+            typed_widgets = (w for w in children if type(w) == type(widget))
+            index = next((i for i, w in enumerate(typed_widgets) if w is widget), None)
 
             if index is None:
                 # FIXME: What to do here instead?
@@ -644,7 +573,6 @@ class Resolver:
     @classmethod
     def deserialize_object(cls, path):
         target = path[-1]
-        target_type = cls.deserialize_type(target.type)
 
         # Find target object by name
         if target.name:
@@ -657,28 +585,16 @@ class Resolver:
                             target.name)
 
         # If target widget doesn't have a name, find it in the tree
-        def candidates(i, widgets):
-            # TODO: make this function nicer
-            target = path[i]
-            target_type = cls.deserialize_type(target.type)
-            if i == len(path) - 1:
-                # This is the last element in the path, the true target
-                return iter((nth(target.index,
-                                 (w for w in widgets if type(w) == target_type)),))
-            return candidates(i + 1,
-                              cls._get_children(nth(target.index,
-                                                    (w for w in widgets
-                                                     if type(w) == target_type))))
+        def get_child(i, widgets):
+            element = path[i]
+            widget = typed_nth(element.index,
+                               cls.deserialize_type(element.type),
+                               widgets)
+            if element == target or widget is None:
+                return widget
+            return get_child(i + 1, cls._get_children(widget))
 
-        # target_with_name = next((i for i in reversed(path) if i.name), None)
-        # if target_with_name:
-        #     i = path.index(target_with_name)
-        #     try:
-        #         return next(candidates(i, (cls._find_by_name(target_with_name),)))
-        #     except StopIteration:
-        #         pass
-
-        return next(candidates(0, qApp.topLevelWidgets()), None)
+        return get_child(0, qApp.topLevelWidgets())
 
     def getstate(self, obj, event):
         """Return picklable state of the object and its event"""
@@ -726,7 +642,7 @@ class _EventFilter:
     def wait_for_app_start(method):
         is_started = False
 
-        def f(self, obj, event):
+        def wrapper(self, obj, event):
             nonlocal is_started
             if not is_started:
                 log.debug('Caught %s (%s) event but app not yet fully "started"',
@@ -743,7 +659,7 @@ class _EventFilter:
             # I think this return (False) should be here (instead of proceeding
             # with the filter method).
             return method(self, obj, event) if is_started else False
-        return f
+        return wrapper
 
     def close(self):
         pass
@@ -783,18 +699,17 @@ class EventRecorder(_EventFilter):
                       not isinstance(obj, QWidget))  # FIXME: This condition is too strict (QGraphicsItems are QOjects)
 
         log_ = log.debug if is_skipped else log.info
-        log.info('Caught %s%s %s event (%s) on object %s',
-                 'skipped' if is_skipped else 'recorded',
-                 ' spontaneous' if event.spontaneous() else '',
-                 EVENT_TYPE.get(event.type(),
-                                'Unknown(type=' + str(event.type()) + ')'),
-                 event.__class__.__name__, obj)
-
-        # Before any event on any widget, make sure the window of that window
+        log_('Caught %s%s %s event (%s) on object %s',
+             'skipped' if is_skipped else 'recorded',
+             ' spontaneous' if event.spontaneous() else '',
+             EVENT_TYPE.get(event.type(),
+                            'Unknown(type=' + str(event.type()) + ')'),
+             event.__class__.__name__, obj)
+        # Before any event on any widget, make sure the window of that widget
         # is active and raised (in front). This is required for replaying
         # without a window manager.
         if (isinstance(obj, QWidget) and
-                event.type() != QtCore.QEvent.MouseMove and
+                event.type() == QtCore.QEvent.MouseButtonPress and
                 not is_skipped and
                 not obj.isActiveWindow() and
                 event.spontaneous()):
@@ -835,7 +750,7 @@ class EventReplayer(_EventFilter):
         self.resolver = Resolver(obj_cache)
 
     @_EventFilter.wait_for_app_start
-    def eventFilter(self, obj, event):
+    def eventFilter(self, _, event):
         if (event.type() == QtCore.QEvent.Timer and
                 event.timerId() == self.timer.timerId()):
             # Skip self's timer events
@@ -881,12 +796,12 @@ class EventExplainer:
             self.resolver.print_state(i, *event)
 
 
-def EventFilter(type, *args):
+def EventFilter(klass, *args):
     """
     Return an instance of type'd filter with closure over correct
     (PyQt4's or PyQt5's) version of QtCore.QObject.
     """
-    class EventFilter(type, QtCore.QObject):
+    class EventFilter(klass, QtCore.QObject):
         """
         This class is a wrapper around above EventRecorder / EventReplayer.
         Qt requires that the object that filters events with eventFilter() is
@@ -935,18 +850,18 @@ def main():
     QtGui.QApplication = QApplication
 
     # Prevent exit with zero status from inside the app. We need to exit from this app.
-    def exit(status=0):
+    def logging_exit(status=0):
         log.warning('Prevented call to sys.exit() with status: %s', str(status))
         if status != 0:
             log.warning('But the exit status was non-zero, so quitting')
             REAL_EXIT(status)
-    sys.exit = exit
+    sys.exit = logging_exit
 
     # Qt doesn't raise exceptions out of its event loop; but this works
-    def excepthook(type, value, tback):
+    def excepthook(etype, value, tback):
         import traceback
         log.error('Unhandled exception encountered')
-        traceback.print_exception(type, value, tback)
+        traceback.print_exception(etype, value, tback)
         REAL_EXIT(2)
     sys.excepthook = excepthook
 
