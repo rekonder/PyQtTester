@@ -185,7 +185,7 @@ def parse_args():
     parser_record.add_argument(
         '--events-include', metavar='REGEX',
         default=r'MouseEvent,KeyEvent,CloseEvent,FocusEvent,DragLeaveEvent,DragEnterEvent,HoverEvent,HideEvent,'
-                'ShowEvent,StatusTipEvent,ResizeEvent,SocketNotifier',  # TODO: add Drag, Focus, Hover ?
+                'ShowEvent,StatusTipEvent,ResizeEvent,SocketNotifier,StatusTipEvent', # TODO: add Drag, Focus, Hover ?
                 #ChildEvent do not work'
         help='When recording, record only events that match the filter.')
     parser_record.add_argument(
@@ -480,9 +480,13 @@ class Resolver:
                                                       value.height())
         if isinstance(value, (QtCore.QSize, QtCore.QSizeF)):
             return 'QtCore.{}({}, {})'.format(type(value).__name__,
-                                                        value.width(),
-                                                        value.height())
-        # Perhaps it's an enum value from Qt namespace
+                                                    value.width(),
+                                                    value.height())
+        #if isinstance(value, (QtGui.QActionEvent)):
+        #    return 'QtGui.{}({}, {}, {})'.format(type(value).__name__,value.parent(), value.type(), value.action(), value.before())
+
+        #if isinstance(value, (QtCore.QString)):
+        #    return '{}()'.format(type(value).__name__)
         assert isinstance(Qt.LeftButton, int)
         if isinstance(value, int):
             s = cls._qenum_key(Qt, value)
@@ -515,8 +519,9 @@ class Resolver:
         'QShowEvent' : [],
         'QStatusTipEvent' : 'tip'.split(),
         'QResizeEvent' : 'size oldSize'.split(),
+        'QSocketNotifier' : 'socket type parent'.split(), #problem with QObject* parent
         'QActionEvent' : 'type action before'.split(),
-        'QSocketNotifier' : 'socket type parent'.split(),
+        'QStatusTipEvent' : 'tip'.split(),
     }
 
     @classmethod
@@ -748,6 +753,7 @@ class EventRecorder(_EventFilter):
     def __init__(self, file, events_include, events_exclude):
         super().__init__()
         self.file = file
+        self.spuscen = []
 
         # Prepare the recorded events stack;
         # the first entry is the protocol version
@@ -797,6 +803,9 @@ class EventRecorder(_EventFilter):
             serialized = self.resolver.getstate(obj, event)
             if serialized:
                 self.events.append(serialized)
+        if is_skipped:
+            self.spuscen.append(EVENT_TYPE.get(event.type(),
+                                 'Unknown(type=' + str(event.type()) + ')'))
         return False
 
     def close(self):
@@ -806,6 +815,9 @@ class EventRecorder(_EventFilter):
         log.info("Scenario of %d events written into '%s'",
                  len(self.events) - SCENARIO_FORMAT_VERSION - 1, self.file.name)
         log.debug(self.events)
+
+        for i in set(self.spuscen):
+            log.info(i)
 
 class EventReplayer(_EventFilter):
     def __init__(self, file):
